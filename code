@@ -1,0 +1,121 @@
+# Install required packages
+!pip install gradio
+!wget https://www.cs.cornell.edu/~cristian/data/cornell_movie_dialogs_corpus.zip
+!unzip cornell_movie_dialogs_corpus.zip
+
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.preprocessing.text import Tokenizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.layers import Input, LSTM, Dense, Embedding, Bidirectional
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
+import re
+import gradio as gr
+
+# Configuration
+MAX_SAMPLES = 100000  # Reduce if memory issues
+MAX_VOCAB_SIZE = 20000
+EMBEDDING_DIM = 256
+LSTM_UNITS = 512
+BATCH_SIZE = 64
+EPOCHS = 30
+MAX_LENGTH = 20
+
+# Load and process dataset
+def load_conversations():
+    lines = open('cornell movie-dialogs corpus/movie_lines.txt',
+                encoding='utf-8', errors='ignore').read().split('\n')
+    conv_lines = open('cornell movie-dialogs corpus/movie_conversations.txt',
+                     encoding='utf-8', errors='ignore').read().split('\n')
+
+    # Create dictionary of line IDs to text
+    id2line = {}
+    for line in lines:
+        parts = line.split(' +++$+++ ')
+        if len(parts) == 5:
+            id2line[parts[0]] = parts[4]
+
+    # Create list of conversations
+    conversations = []
+    for conv in conv_lines[:-1]:
+        parts = conv.split(' +++$+++ ')[-1][1:-1].replace("'", "").split(', ')
+        conversations.append(parts)
+
+    # Create question-answer pairs
+    questions = []
+    answers = []
+    for conv in conversations:
+        for i in range(len(conv)-1):
+            questions.append(id2line[conv[i]])
+            answers.append(id2line[conv[i+1]])
+            if len(questions) >= MAX_SAMPLES:
+                return questions, answers
+    return questions, answers
+
+questions, answers = load_conversations()
+
+# Preprocessing
+def preprocess_text(text):
+    text = text.lower()
+    text = re.sub(r"i'm", "i am", text)
+    text = re.sub(r"he's", "he is", text)
+    text = re.sub(r"she's", "she is", text)
+    text = re.sub(r"that's", "that is", text)
+    text = re.sub(r"what's", "what is", text)
+    text = re.sub(r"where's", "where is", text)
+    text = re.sub(r"\'ll", " will", text)
+    text = re.sub(r"\'ve", " have", text)
+    text = re.sub(r"\'re", " are", text)
+    text = re.sub(r"\'d", " would", text)
+    text = re.sub(r"won't", "will not", text)
+    text = re.sub(r"can't", "cannot", text)
+    text = re.sub(r"[-()\"#/@;:<>{}+=~|.?,]", "", text)
+    return text
+
+questions = [preprocess_text(q) for q in questions]
+answers = [preprocess_text(a) for a in answers]
+
+# Add start and end tokens to answers
+answers = ['<start> ' + a + ' <end>' for a in answers]
+
+# Tokenization
+tokenizer = Tokenizer(num_words=MAX_VOCAB_SIZE, filters='', oov_token='<OOV>')
+tokenizer.fit_on_texts(questions + answers)
+
+# Sequence conversion and padding
+question_sequences = tokenizer.texts_to_sequences(questions)
+answer_sequences = tokenizer.texts_to_sequences(answers)
+
+question_sequences = pad_sequences(question_sequences, maxlen=MAX_LENGTH, padding='post')
+answer_sequences = pad_sequences(answer_sequences, maxlen=MAX_LENGTH+2, padding='post')  # +2 for start/end tokens
+
+# Prepare decoder input and output
+decoder_input_data = answer_sequences[:, :-1]
+decoder_target_data = answer_sequences[:, 1:]
+
+# Encoder
+encoder_inputs = Input(shape=(None,))
+enc_emb = Embedding(MAX_VOCAB_SIZE, EMBEDDING_DIM)(encoder_inputs)
+enc_lstm = Bidirectional(LSTM(LSTM_UNITS, return_state=True))
+_, forward_h, forward_c, backward_h, backward_c = enc_lstm(enc_emb)
+state_h = tf.keras.layers.Concatenate()([forward_h, backward_h])
+state_c = tf.keras.layers.Concatenate()([forward_c, backward_c])
+encoder_states = [state_h, state_c]
+
+# Decoder
+decoder_inputs = Input(shape=(None,))
+dec_emb = Embedding(MAX_VOCAB_SIZE, EMBEDDING_DIM)
+dec_emb_output = dec_emb(decoder_inputs)
+
+decoder_lstm = LSTM(LSTM_UNITS*2, return_sequences=True, return_state=True)
+decoder_outputs, _, _ = decoder_lstm(dec_emb_output, initial_state=encoder_states)
+
+decoder_dense = Dense(MAX_VOCAB_SIZE, activation='softmax')
+output = decoder_dense(decoder_outputs)
+
+# Model
+model = Model([encoder_inputs, decoder_inputs], output)
+model.compile(optimizer=Adam(learning_rate=0.001),
+              loss='sparse_categorical_crossentropy',
+              metrics=['accuracy'])
